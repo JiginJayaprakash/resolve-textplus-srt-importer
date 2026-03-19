@@ -1,0 +1,333 @@
+-- ============================================================
+-- REGION: INIT
+-- ============================================================
+local resolve = resolve or _G.resolve
+local project  = resolve:GetProjectManager():GetCurrentProject()
+local timeline = project:GetCurrentTimeline()
+if not timeline then print("ERROR: No active timeline.") return end
+math.randomseed(os.time())
+
+-- ============================================================
+-- REGION: CONFIGURATION
+-- ============================================================
+local srtPath      = ""
+local imagesFolder = ""
+local frameRate    = tonumber(project:GetSetting("timelineFrameRate"))
+local tsf          = timeline:GetStartFrame()
+print(string.format("[INIT] frameRate=%d  timelineStart=%d", frameRate, tsf))
+
+-- ============================================================
+-- REGION: CHARACTER CONFIG
+-- To add a new character: add one block here. That's it.
+-- ============================================================
+local CHARACTERS = {
+    character1 = {
+        pan      = -150,
+        tilt     = -400,
+        zoom     =  0.5,
+        flipX    = false,
+        fallback = "",
+        trackIdx = nil,  -- assigned automatically
+    },
+    character2 = {
+        pan      =  150,
+        tilt     =  400,
+        zoom     =  0.5,
+        flipX    = true,
+        fallback = "",
+        trackIdx = nil,  -- assigned automatically
+    },
+    -- Example: adding a third character requires only this block:
+    -- character3 = {
+    --     pan      =  0,
+    --     tilt     =  0,
+    --     zoom     =  0.5,
+    --     flipX    = false,
+    --     fallback = "",
+    --     trackIdx = nil,
+    -- },
+}
+
+-- ============================================================
+-- REGION: SPEAKER + IMAGE MAP
+-- ============================================================
+local lineData = {
+    [1]  = { "character1",  "character1_Surprised.png"  },
+    [2]  = { "character2",  "character2_Normal.png"     },
+   
+}
+
+-- ============================================================
+-- REGION: HELPERS
+-- ============================================================
+function srtToFrames(timeStr, fps)
+    local h, m, s, ms = timeStr:match("(%d%d):(%d%d):(%d%d),(%d%d%d)")
+    if not h then return nil end
+    return math.floor(((tonumber(h)*3600)+(tonumber(m)*60)+tonumber(s)+(tonumber(ms)/1000))*fps) + tsf
+end
+
+function framesToTC(totalFrames, fps)
+    local f = totalFrames % fps
+    local totalSec = math.floor(totalFrames / fps)
+    local s = totalSec % 60
+    local m = math.floor(totalSec / 60) % 60
+    local h = math.floor(totalSec / 3600)
+    return string.format("%02d:%02d:%02d:%02d", h, m, s, f)
+end
+
+function fileExists(path)
+    local f = io.open(path, "r")
+    if f then f:close() return true end
+    return false
+end
+
+-- ============================================================
+-- REGION: MEDIA POOL
+-- ============================================================
+local mediaPool   = project:GetMediaPool()
+local rootFolder  = mediaPool:GetRootFolder()
+local importCache = {}
+
+function getOrImportImage(filename, speakerName)
+    local char     = CHARACTERS[speakerName]
+    local fullPath = imagesFolder .. filename
+
+    if not fileExists(fullPath) then
+        local fallback = char and char.fallback or "Unknown_Normal.png"
+        print("[WARN] " .. filename .. " missing → fallback: " .. fallback)
+        filename  = fallback
+        fullPath  = imagesFolder .. fallback
+    end
+
+    if importCache[filename] then return importCache[filename] end
+
+    for _, clip in ipairs(rootFolder:GetClipList()) do
+        if clip:GetName() == filename then
+            importCache[filename] = clip
+            return clip
+        end
+    end
+
+    if not fileExists(fullPath) then
+        print("[ERROR] Fallback also missing: " .. fullPath)
+        return nil
+    end
+
+    local imported = mediaPool:ImportMedia({ fullPath })
+    if imported and imported[1] then
+        importCache[filename] = imported[1]
+        print("[IMPORT] " .. filename)
+        return imported[1]
+    end
+
+    print("[ERROR] ImportMedia failed: " .. fullPath)
+    return nil
+end
+
+-- ============================================================
+-- REGION: TRACK SETUP — auto-creates one track per character
+-- ============================================================
+local vTrackCount = timeline:GetTrackCount("video")
+for i = 1, vTrackCount do
+    timeline:SetTrackEnable("video", i, false)
+end
+
+-- Assign track indices dynamically
+local charOrder = {}  -- preserves insertion order for logging
+for name, _ in pairs(CHARACTERS) do
+    table.insert(charOrder, name)
+end
+table.sort(charOrder)  -- deterministic order
+
+for _, name in ipairs(charOrder) do
+    timeline:AddTrack("video")
+    vTrackCount = vTrackCount + 1
+    CHARACTERS[name].trackIdx = vTrackCount
+    print(string.format("[TRACKS] %s → V%d", name, vTrackCount))
+end
+
+-- ============================================================
+-- REGION: SRT PARSE
+-- ============================================================
+local file = io.open(srtPath, "r")
+if not file then print("[ERROR] SRT not found: " .. srtPath) return end
+local content = file:read("*all")
+file:close()
+content = content:gsub("\r\n", "\n") .. "\n\n"
+
+local srtLines = {}
+for block in content:gmatch("(%d+\n%d%d:%d%d:%d%d,%d%d%d %-%-> %d%d:%d%d:%d%d,%d%d%d.-)\n\n") do
+    local num     = tonumber(block:match("^(%d+)\n"))
+    local startTC = block:match("(%d%d:%d%d:%d%d,%d%d%d) %-%->")
+    local endTC   = block:match("%-%-> (%d%d:%d%d:%d%d,%d%d%d)")
+    if num and startTC and endTC then
+        table.insert(srtLines, {
+            num    = num,
+            startF = srtToFrames(startTC, frameRate),
+            endF   = srtToFrames(endTC,   frameRate),
+        })
+    end
+end
+print(string.format("[SRT] Parsed %d lines", #srtLines))
+
+-- ============================================================
+-- REGION: SPLIT LINES PER CHARACTER
+-- ============================================================
+local charLines = {}
+for name, _ in pairs(CHARACTERS) do
+    charLines[name] = {}
+end
+
+for _, line in ipairs(srtLines) do
+    local data        = lineData[line.num]
+    local speakerName = data and data[1] or charOrder[1]  -- default to first char
+    local imgFile     = data and data[2]
+    local char        = CHARACTERS[speakerName]
+
+    if not imgFile then
+        imgFile = char and char.fallback or "Unknown_Normal.png"
+    end
+
+    if charLines[speakerName] then
+        table.insert(charLines[speakerName], { line = line, imgFile = imgFile })
+    else
+        print(string.format("[WARN] Unknown speaker '%s' on line %d — skipping", speakerName, line.num))
+    end
+end
+
+-- ============================================================
+-- REGION: PROCESS TRACK (generic — no per-character logic)
+-- ============================================================
+function processTrack(entries, char, speakerName)
+    local trackIdx = char.trackIdx
+    print(string.format("[TRACK] Processing %d clips for '%s' on V%d", #entries, speakerName, trackIdx))
+
+    -- Enable only this track, disable all others
+    for name, c in pairs(CHARACTERS) do
+        timeline:SetTrackEnable("video", c.trackIdx, name == speakerName)
+    end
+
+    local countBefore = 0
+    local existingItems = timeline:GetItemListInTrack("video", trackIdx)
+    if existingItems then countBefore = #existingItems end
+
+    -- Step 1: Append all clips sequentially
+    for _, entry in ipairs(entries) do
+        local duration = entry.line.endF - entry.line.startF
+        if duration <= 0 then
+            print(string.format("  [SKIP] Line %d zero duration", entry.line.num))
+        else
+            local imgItem = getOrImportImage(entry.imgFile, speakerName)
+            if imgItem then
+                timeline:SetCurrentTimecode(framesToTC(entry.line.startF, frameRate))
+                timeline:SetMarkInOut(entry.line.startF, entry.line.endF)
+
+                local result = mediaPool:AppendToTimeline({{
+                    ["mediaPoolItem"] = imgItem,
+                    ["startFrame"]    = 0,
+                    ["endFrame"]      = duration,
+                    ["recordFrame"]   = entry.line.startF,
+                    ["trackIndex"]    = trackIdx,
+                    ["mediaType"]     = 1,
+                }})
+
+                local itemsNow = timeline:GetItemListInTrack("video", trackIdx)
+                local countNow = itemsNow and #itemsNow or 0
+                print(string.format("  [INS] Line %2d dur=%d trackCount=%d result=%s",
+                    entry.line.num, duration, countNow, tostring(result ~= nil)))
+            end
+        end
+    end
+
+    -- Step 2: Re-fetch and match by insertion order
+    local trackItems = timeline:GetItemListInTrack("video", trackIdx)
+    if not trackItems then
+        print("[ERROR] Cannot read track " .. trackIdx)
+        for name, c in pairs(CHARACTERS) do
+            timeline:SetTrackEnable("video", c.trackIdx, true)
+        end
+        return
+    end
+
+    print(string.format("  [TRACK] Total clips on V%d: %d (pre-existing: %d  new: %d)",
+        trackIdx, #trackItems, countBefore, #trackItems - countBefore))
+
+    local newClips = {}
+    for i = countBefore + 1, #trackItems do
+        table.insert(newClips, trackItems[i])
+    end
+
+    -- Step 3: Move each clip to its correct SRT position + apply transforms
+    for i, entry in ipairs(entries) do
+        local clip = newClips[i]
+        if clip then
+            local duration = entry.line.endF - entry.line.startF
+            local gotStart = clip:GetStart()
+            local gotEnd   = clip:GetEnd()
+
+            if gotStart == nil or gotEnd == nil then
+                print(string.format("  [WARN] Line %d clip GetStart/GetEnd nil — skipping", entry.line.num))
+            else
+                print(string.format("  [MOVE] Line %2d: currentStart=%d targetStart=%d dur=%d",
+                    entry.line.num, gotStart, entry.line.startF, duration))
+
+                if gotStart ~= entry.line.startF then
+                    clip:SetProperty("Start", entry.line.startF)
+                end
+                local newEnd = clip:GetStart() + duration
+                if clip:GetEnd() ~= newEnd then
+                    clip:SetProperty("End", newEnd)
+                end
+
+                -- Transforms from character config
+                clip:SetProperty("ZoomGang", true)
+                clip:SetProperty("ZoomX",    char.zoom)
+                clip:SetProperty("ZoomY",    char.zoom)
+                clip:SetProperty("Pan",      char.pan)
+                clip:SetProperty("Tilt",     char.tilt)
+                clip:SetProperty("FlipX",    char.flipX)
+
+                print(string.format("  [OK] Line %2d → start=%d end=%d",
+                    entry.line.num, clip:GetStart(), clip:GetEnd()))
+            end
+        else
+            print(string.format("  [WARN] No clip at index %d for line %d", i, entry.line.num))
+        end
+    end
+
+    -- Re-enable all tracks
+    for name, c in pairs(CHARACTERS) do
+        timeline:SetTrackEnable("video", c.trackIdx, true)
+    end
+end
+
+-- ============================================================
+-- REGION: PROCESS ALL CHARACTERS (auto-loop — no manual calls)
+-- ============================================================
+for _, name in ipairs(charOrder) do
+    local char    = CHARACTERS[name]
+    local entries = charLines[name]
+    if #entries > 0 then
+        processTrack(entries, char, name)
+    else
+        print(string.format("[SKIP] No lines for '%s'", name))
+    end
+end
+
+timeline:ClearMarkInOut()
+
+
+-- ============================================================
+-- REGION: RESTORE ALL TRACKS
+-- ============================================================
+for i = 1, (vTrackCount - #charOrder) do
+    timeline:SetTrackEnable("video", i, true)
+end
+for _, name in ipairs(charOrder) do
+    timeline:SetTrackEnable("video", CHARACTERS[name].trackIdx, true)
+end
+
+-- Summary log
+for _, name in ipairs(charOrder) do
+    print(string.format("[DONE] %s → V%d", name, CHARACTERS[name].trackIdx))
+end
